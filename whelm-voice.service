@@ -1,0 +1,35 @@
+[Unit]
+Description=Whelm Voice Server
+After=network.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whelm
+Group=whelm
+WorkingDirectory=/opt/whelm
+ExecStart=/opt/whelm/whelm-voice-server
+Restart=always
+RestartSec=5
+
+# Environment - edit these!
+Environment="WHELM_DB_DSN=whelm:password@tcp(localhost:3306)/whelm?parseTime=true"
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=512M
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

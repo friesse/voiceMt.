@@ -2,19 +2,19 @@ package main
 
 import (
 	"bufio"
-	"database/sql"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	_ "github.com/go-sql-driver/mysql"
 )
 
 // === CONFIG ===
@@ -42,6 +42,9 @@ const (
 
 	// UDP packet size limit
 	MAX_UDP_PACKET = 1500
+
+	// PHP backend base URL
+	PHP_BASE_URL = "https://wlm.fragmount.net/"
 )
 
 // === DATA STRUCTURES ===
@@ -73,7 +76,6 @@ type Message struct {
 }
 
 type Server struct {
-	db          *sql.DB
 	users       map[int]*User          // userID -> User
 	usersByConn map[net.Conn]*User     // conn -> User
 	calls       map[string]*Call       // callID -> Call
@@ -102,25 +104,7 @@ func main() {
 	log.Printf("Config: %dkbps audio, %dMbps up/down limit, max %d calls",
 		AUDIO_BITRATE_KBPS, MAX_UPLOAD_BPS/1_000_000, MAX_CALLS)
 
-	// DB connection string from env or default
-	dsn := os.Getenv("WHELM_DB_DSN")
-	if dsn == "" {
-		dsn = "whelm:password@tcp(localhost:3306)/whelm?parseTime=true"
-	}
-
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
-	}
-	defer db.Close()
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("Database ping failed: %v", err)
-	}
-	log.Println("Database connected")
-
 	srv := &Server{
-		db:          db,
 		users:       make(map[int]*User),
 		usersByConn: make(map[net.Conn]*User),
 		calls:       make(map[string]*Call),
@@ -273,15 +257,9 @@ func (s *Server) handleAuth(conn net.Conn, token string) *User {
 		return nil
 	}
 
-	var userID int
-	var username string
-	err := s.db.QueryRow(
-		"SELECT id, username FROM users WHERE session_token = ?",
-		token,
-	).Scan(&userID, &username)
-
+	userID, username, err := s.fetchUserFromPHP(token)
 	if err != nil {
-		log.Printf("Auth failed for token: %v", err)
+		log.Printf("Auth failed for token via PHP: %v", err)
 		return nil
 	}
 
@@ -428,16 +406,65 @@ func (s *Server) handleHangup(user *User) {
 }
 
 func (s *Server) handleMessage(sender *User, recipientID int, content string) {
-	// Store in database
-	channelID := s.getChannelID(sender.ID, recipientID)
+	// Persist via PHP backend and try to deliver in real-time
+	if strings.TrimSpace(content) == "" {
+		s.sendToConn(sender.Conn, "ERROR Empty message")
+		return
+	}
 
-	_, err := s.db.Exec(
-		"INSERT INTO messages (sender_id, channel_id, content) VALUES (?, ?, ?)",
-		sender.ID, channelID, content,
-	)
+	if sender.SessionToken == "" {
+		s.sendToConn(sender.Conn, "ERROR No session token")
+		return
+	}
+
+	payload := map[string]interface{}{
+		"token":        sender.SessionToken,
+		"recipient_id": recipientID,
+		"content":      content,
+	}
+
+	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("Failed to store message: %v", err)
+		log.Printf("Failed to marshal send_message payload: %v", err)
 		s.sendToConn(sender.Conn, "ERROR Failed to send message")
+		return
+	}
+
+	req, err := http.NewRequest("POST", PHP_BASE_URL+"send_message.php", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Failed to create send_message request: %v", err)
+		s.sendToConn(sender.Conn, "ERROR Failed to send message")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("send_message.php HTTP error: %v", err)
+		s.sendToConn(sender.Conn, "ERROR Failed to send message")
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("send_message.php read error: %v", err)
+		s.sendToConn(sender.Conn, "ERROR Failed to send message")
+		return
+	}
+
+	var phpResp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &phpResp); err != nil {
+		log.Printf("send_message.php JSON error: %v - body: %s", err, string(respBody))
+		s.sendToConn(sender.Conn, "ERROR Failed to send message")
+		return
+	}
+	if !phpResp.Success {
+		log.Printf("send_message.php returned error: %s", phpResp.Error)
+		s.sendToConn(sender.Conn, "ERROR "+phpResp.Error)
 		return
 	}
 
@@ -607,13 +634,85 @@ func (s *Server) heartbeatChecker() {
 }
 
 func (s *Server) updateUserStatus(userID int, status string) {
-	_, err := s.db.Exec(
-		"UPDATE users SET status = ?, last_seen = NOW() WHERE id = ?",
-		status, userID,
-	)
-	if err != nil {
-		log.Printf("Failed to update status for user %d: %v", userID, err)
+	// Inform PHP backend about status via heartbeat.php
+	s.mu.RLock()
+	user, ok := s.users[userID]
+	s.mu.RUnlock()
+	if !ok || user.SessionToken == "" {
+		return
 	}
+
+	payload := map[string]interface{}{
+		"token": user.SessionToken,
+	}
+	if status != "" {
+		payload["status"] = status
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal heartbeat payload: %v", err)
+		return
+	}
+
+	req, err := http.NewRequest("POST", PHP_BASE_URL+"heartbeat.php", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("Failed to create heartbeat request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("heartbeat.php HTTP error: %v", err)
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+}
+
+// === PHP BACKEND HELPERS ===
+
+func (s *Server) fetchUserFromPHP(token string) (int, string, error) {
+	payload := map[string]string{
+		"token": token,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "", fmt.Errorf("marshal whoami payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", PHP_BASE_URL+"whoami.php", bytes.NewReader(body))
+	if err != nil {
+		return 0, "", fmt.Errorf("create whoami request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("whoami HTTP error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, "", fmt.Errorf("whoami read error: %w", err)
+	}
+
+	var phpResp struct {
+		Success  bool   `json:"success"`
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &phpResp); err != nil {
+		return 0, "", fmt.Errorf("whoami JSON error: %w (body: %s)", err, string(respBody))
+	}
+	if !phpResp.Success {
+		return 0, "", fmt.Errorf("whoami error: %s", phpResp.Error)
+	}
+
+	return phpResp.ID, phpResp.Username, nil
 }
 
 // === BANDWIDTH MANAGEMENT ===

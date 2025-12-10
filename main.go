@@ -67,6 +67,16 @@ type Call struct {
 	Active     bool
 }
 
+// GroupCall for multi-user voice in group chats
+type GroupCall struct {
+	ID          string
+	GroupID     int
+	Participants map[int]bool // userID -> active
+	StartedAt   time.Time
+	Active      bool
+	mu          sync.RWMutex
+}
+
 type Message struct {
 	SenderID    int    `json:"sender_id"`
 	RecipientID int    `json:"recipient_id"`
@@ -78,12 +88,22 @@ type Server struct {
 	users       map[int]*User          // userID -> User
 	usersByConn map[net.Conn]*User     // conn -> User
 	calls       map[string]*Call       // callID -> Call
+	groupCalls  map[int]*GroupCall     // groupID -> GroupCall
 	udpUserMap  map[string]*net.UDPAddr // userID -> UDP addr
 	udpAddrMap  map[string]int          // UDP addr string -> userID
 
-	mu       sync.RWMutex
-	udpMu    sync.RWMutex
-	callsMu  sync.RWMutex
+	// Real-time subscriptions: channelID -> set of userIDs
+	subscriptions map[int64]map[int]bool
+	// User's subscribed channels: userID -> set of channelIDs
+	userSubs      map[int]map[int64]bool
+	// User's friends (for status broadcasts): userID -> set of friendIDs
+	userFriends   map[int]map[int]bool
+
+	mu          sync.RWMutex
+	udpMu       sync.RWMutex
+	callsMu     sync.RWMutex
+	groupCallMu sync.RWMutex
+	subsMu      sync.RWMutex
 
 	// Bandwidth tracking
 	uploadBytes   atomic.Int64
@@ -104,12 +124,16 @@ func main() {
 		AUDIO_BITRATE_KBPS, MAX_UPLOAD_BPS/1_000_000, MAX_CALLS)
 
 	srv := &Server{
-		users:       make(map[int]*User),
-		usersByConn: make(map[net.Conn]*User),
-		calls:       make(map[string]*Call),
-		udpUserMap:  make(map[string]*net.UDPAddr),
-		udpAddrMap:  make(map[string]int),
-		lastBWReset: time.Now(),
+		users:         make(map[int]*User),
+		usersByConn:   make(map[net.Conn]*User),
+		calls:         make(map[string]*Call),
+		groupCalls:    make(map[int]*GroupCall),
+		udpUserMap:    make(map[string]*net.UDPAddr),
+		udpAddrMap:    make(map[string]int),
+		subscriptions: make(map[int64]map[int]bool),
+		userSubs:      make(map[int]map[int64]bool),
+		userFriends:   make(map[int]map[int]bool),
+		lastBWReset:   time.Now(),
 	}
 
 	// Start UDP relay
@@ -240,6 +264,98 @@ func (s *Server) handleTCPClient(conn net.Conn) {
 			content := msgParts[1]
 			s.handleMessage(user, recipientID, content)
 
+		case "JOIN_GROUP_CALL":
+			// JOIN_GROUP_CALL <group_id>
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			groupID, _ := strconv.Atoi(payload)
+			s.handleJoinGroupCall(user, groupID)
+
+		case "LEAVE_GROUP_CALL":
+			// LEAVE_GROUP_CALL <group_id>
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			groupID, _ := strconv.Atoi(payload)
+			s.handleLeaveGroupCall(user, groupID)
+
+		case "SUBSCRIBE":
+			// SUBSCRIBE <channel_id> - subscribe to real-time updates for a channel
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			channelID, _ := strconv.ParseInt(payload, 10, 64)
+			s.handleSubscribe(user, channelID)
+
+		case "UNSUBSCRIBE":
+			// UNSUBSCRIBE <channel_id>
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			channelID, _ := strconv.ParseInt(payload, 10, 64)
+			s.handleUnsubscribe(user, channelID)
+
+		case "GROUP_MSG":
+			// GROUP_MSG <group_id> <content> - send message to group with real-time relay
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			msgParts := strings.SplitN(payload, " ", 2)
+			if len(msgParts) < 2 {
+				s.sendToConn(conn, "ERROR Invalid GROUP_MSG format")
+				continue
+			}
+			groupID, _ := strconv.Atoi(msgParts[0])
+			content := msgParts[1]
+			s.handleGroupMessage(user, groupID, content)
+
+		case "STATUS":
+			// STATUS <status> - broadcast status change to connected friends
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			s.handleStatusBroadcast(user, payload)
+
+		case "TYPING":
+			// TYPING <channel_id> - notify typing indicator
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			channelID, _ := strconv.ParseInt(payload, 10, 64)
+			s.handleTyping(user, channelID)
+
+		case "INVITE_NOTIFY":
+			// INVITE_NOTIFY <user_id> <group_id> <group_name> - notify user of group invite
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			parts := strings.SplitN(payload, " ", 3)
+			if len(parts) < 3 {
+				s.sendToConn(conn, "ERROR Invalid INVITE_NOTIFY format")
+				continue
+			}
+			targetID, _ := strconv.Atoi(parts[0])
+			groupID, _ := strconv.Atoi(parts[1])
+			groupName := parts[2]
+			s.handleInviteNotify(user, targetID, groupID, groupName)
+
+		case "PROFILE_UPDATE":
+			// PROFILE_UPDATE <json> - broadcast profile changes to friends
+			if user == nil {
+				s.sendToConn(conn, "ERROR Not authenticated")
+				continue
+			}
+			s.handleProfileUpdate(user, payload)
+
 		default:
 			s.sendToConn(conn, "ERROR Unknown command: %s", cmd)
 		}
@@ -284,6 +400,9 @@ func (s *Server) handleAuth(conn net.Conn, token string) *User {
 
 	s.updateUserStatus(userID, "online")
 	log.Printf("User %d (%s) authenticated", userID, username)
+
+	// Load friends list for status broadcasts
+	go s.loadUserFriends(userID, token)
 
 	return user
 }
@@ -404,6 +523,122 @@ func (s *Server) handleHangup(user *User) {
 	s.sendToConn(user.Conn, "OK HANGUP")
 }
 
+// === GROUP VOICE CALLS ===
+
+func (s *Server) handleJoinGroupCall(user *User, groupID int) {
+	if groupID <= 0 {
+		s.sendToConn(user.Conn, "ERROR Invalid group ID")
+		return
+	}
+
+	// Check if user is already in a 1:1 call
+	if s.userInCall(user.ID) {
+		s.sendToConn(user.Conn, "ERROR Already in a call")
+		return
+	}
+
+	s.groupCallMu.Lock()
+	gc, exists := s.groupCalls[groupID]
+	if !exists {
+		// Create new group call
+		gc = &GroupCall{
+			ID:           fmt.Sprintf("gc_%d_%d", groupID, time.Now().Unix()),
+			GroupID:      groupID,
+			Participants: make(map[int]bool),
+			StartedAt:    time.Now(),
+			Active:       true,
+		}
+		s.groupCalls[groupID] = gc
+	}
+	s.groupCallMu.Unlock()
+
+	gc.mu.Lock()
+	gc.Participants[user.ID] = true
+	participantCount := len(gc.Participants)
+	gc.mu.Unlock()
+
+	// Notify user they joined
+	s.sendToConn(user.Conn, "OK JOIN_GROUP_CALL %d %d", groupID, participantCount)
+
+	// Notify other participants that someone joined
+	gc.mu.RLock()
+	for uid := range gc.Participants {
+		if uid != user.ID {
+			s.mu.RLock()
+			other, ok := s.users[uid]
+			s.mu.RUnlock()
+			if ok {
+				s.sendToConn(other.Conn, "GROUP_CALL_JOIN %d %d %s", groupID, user.ID, user.Username)
+			}
+		}
+	}
+	gc.mu.RUnlock()
+
+	log.Printf("User %d joined group call %d (now %d participants)", user.ID, groupID, participantCount)
+}
+
+func (s *Server) handleLeaveGroupCall(user *User, groupID int) {
+	s.groupCallMu.RLock()
+	gc, exists := s.groupCalls[groupID]
+	s.groupCallMu.RUnlock()
+
+	if !exists {
+		s.sendToConn(user.Conn, "ERROR Not in this group call")
+		return
+	}
+
+	gc.mu.Lock()
+	delete(gc.Participants, user.ID)
+	remaining := len(gc.Participants)
+	gc.mu.Unlock()
+
+	s.sendToConn(user.Conn, "OK LEAVE_GROUP_CALL %d", groupID)
+
+	// Notify others
+	gc.mu.RLock()
+	for uid := range gc.Participants {
+		s.mu.RLock()
+		other, ok := s.users[uid]
+		s.mu.RUnlock()
+		if ok {
+			s.sendToConn(other.Conn, "GROUP_CALL_LEAVE %d %d", groupID, user.ID)
+		}
+	}
+	gc.mu.RUnlock()
+
+	// Clean up if empty
+	if remaining == 0 {
+		s.groupCallMu.Lock()
+		delete(s.groupCalls, groupID)
+		s.groupCallMu.Unlock()
+		log.Printf("Group call %d ended (no participants)", groupID)
+	}
+
+	log.Printf("User %d left group call %d (%d remaining)", user.ID, groupID, remaining)
+}
+
+func (s *Server) getGroupCallParticipants(userID int) (int, []int) {
+	// Returns groupID and list of other participant IDs if user is in a group call
+	s.groupCallMu.RLock()
+	defer s.groupCallMu.RUnlock()
+
+	for groupID, gc := range s.groupCalls {
+		gc.mu.RLock()
+		if gc.Participants[userID] {
+			var others []int
+			for uid := range gc.Participants {
+				if uid != userID {
+					others = append(others, uid)
+				}
+			}
+			gc.mu.RUnlock()
+			return groupID, others
+		}
+		gc.mu.RUnlock()
+	}
+	return 0, nil
+}
+
 func (s *Server) handleMessage(sender *User, recipientID int, content string) {
 	// Persist via PHP backend and try to deliver in real-time
 	if strings.TrimSpace(content) == "" {
@@ -489,7 +724,21 @@ func (s *Server) handleMessage(sender *User, recipientID int, content string) {
 }
 
 func (s *Server) handleDisconnect(user *User) {
-	s.handleHangup(user) // End any active calls
+	s.handleHangup(user) // End any active 1:1 calls
+
+	// Leave any group calls
+	s.groupCallMu.RLock()
+	for groupID, gc := range s.groupCalls {
+		gc.mu.RLock()
+		inCall := gc.Participants[user.ID]
+		gc.mu.RUnlock()
+		if inCall {
+			s.groupCallMu.RUnlock()
+			s.handleLeaveGroupCall(user, groupID)
+			s.groupCallMu.RLock()
+		}
+	}
+	s.groupCallMu.RUnlock()
 
 	s.mu.Lock()
 	delete(s.users, user.ID)
@@ -507,6 +756,9 @@ func (s *Server) handleDisconnect(user *User) {
 		}
 	}
 	s.udpMu.Unlock()
+
+	// Cleanup channel subscriptions and friends cache
+	s.cleanupUserSubscriptions(user.ID)
 
 	s.updateUserStatus(user.ID, "offline")
 	log.Printf("User %d disconnected", user.ID)
@@ -552,7 +804,7 @@ func (s *Server) startUDPRelay() {
 			continue
 		}
 
-		// Find sender and relay to call partner
+		// Find sender and relay to call partner(s)
 		s.udpMu.RLock()
 		senderID, ok := s.udpAddrMap[clientAddr.String()]
 		s.udpMu.RUnlock()
@@ -561,7 +813,28 @@ func (s *Server) startUDPRelay() {
 			continue // Unknown sender, ignore
 		}
 
-		// Find partner in active call
+		// Check if in a group call first
+		groupID, groupPartners := s.getGroupCallParticipants(senderID)
+		if groupID > 0 && len(groupPartners) > 0 {
+			// Relay to all group call participants
+			for _, partnerID := range groupPartners {
+				s.udpMu.RLock()
+				partnerAddr, ok := s.udpUserMap[strconv.Itoa(partnerID)]
+				s.udpMu.RUnlock()
+
+				if ok && partnerAddr != nil {
+					written, err := conn.WriteToUDP(buf[:n], partnerAddr)
+					if err != nil {
+						log.Printf("UDP group relay error: %v", err)
+						continue
+					}
+					s.downloadBytes.Add(int64(written))
+				}
+			}
+			continue
+		}
+
+		// Find partner in active 1:1 call
 		partnerID := s.getCallPartner(senderID)
 		if partnerID == 0 {
 			continue // Not in a call
@@ -780,4 +1053,251 @@ func (s *Server) getChannelID(user1, user2 int) int64 {
 		hash = hash*31 + int64(c)
 	}
 	return hash & 0x7FFFFFFF
+}
+
+// === REAL-TIME MESSAGING ===
+
+func (s *Server) handleSubscribe(user *User, channelID int64) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+
+	// Add user to channel subscribers
+	if s.subscriptions[channelID] == nil {
+		s.subscriptions[channelID] = make(map[int]bool)
+	}
+	s.subscriptions[channelID][user.ID] = true
+
+	// Track user's subscriptions
+	if s.userSubs[user.ID] == nil {
+		s.userSubs[user.ID] = make(map[int64]bool)
+	}
+	s.userSubs[user.ID][channelID] = true
+
+	s.sendToConn(user.Conn, "OK SUBSCRIBE %d", channelID)
+	log.Printf("User %d subscribed to channel %d", user.ID, channelID)
+}
+
+func (s *Server) handleUnsubscribe(user *User, channelID int64) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+
+	if subs, ok := s.subscriptions[channelID]; ok {
+		delete(subs, user.ID)
+		if len(subs) == 0 {
+			delete(s.subscriptions, channelID)
+		}
+	}
+
+	if userChannels, ok := s.userSubs[user.ID]; ok {
+		delete(userChannels, channelID)
+	}
+
+	s.sendToConn(user.Conn, "OK UNSUBSCRIBE %d", channelID)
+}
+
+func (s *Server) handleGroupMessage(user *User, groupID int, content string) {
+	// Channel ID for groups is negative
+	channelID := int64(-groupID)
+
+	// Store message via PHP backend
+	go s.storeGroupMessagePHP(user.SessionToken, groupID, content)
+
+	// Build message JSON for real-time delivery
+	msgData := map[string]interface{}{
+		"sender_id":   user.ID,
+		"sender_name": user.Username,
+		"group_id":    groupID,
+		"channel_id":  channelID,
+		"content":     content,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	msgJSON, _ := json.Marshal(msgData)
+
+	// Relay to all subscribers of this channel
+	s.subsMu.RLock()
+	subscribers := s.subscriptions[channelID]
+	s.subsMu.RUnlock()
+
+	s.mu.RLock()
+	for subUserID := range subscribers {
+		if subUserID == user.ID {
+			continue // Don't echo back to sender
+		}
+		if subUser, ok := s.users[subUserID]; ok {
+			s.sendToConn(subUser.Conn, "NEW_MSG %s", string(msgJSON))
+		}
+	}
+	s.mu.RUnlock()
+
+	s.sendToConn(user.Conn, "OK GROUP_MSG")
+}
+
+func (s *Server) handleStatusBroadcast(user *User, status string) {
+	user.mu.Lock()
+	user.Status = status
+	user.mu.Unlock()
+
+	// Update status in PHP backend
+	s.updateUserStatus(user.ID, status)
+
+	// Broadcast to online friends
+	s.subsMu.RLock()
+	friends := s.userFriends[user.ID]
+	s.subsMu.RUnlock()
+
+	statusData := map[string]interface{}{
+		"user_id":  user.ID,
+		"username": user.Username,
+		"status":   status,
+	}
+	statusJSON, _ := json.Marshal(statusData)
+
+	s.mu.RLock()
+	for friendID := range friends {
+		if friend, ok := s.users[friendID]; ok {
+			s.sendToConn(friend.Conn, "STATUS_UPDATE %s", string(statusJSON))
+		}
+	}
+	s.mu.RUnlock()
+
+	s.sendToConn(user.Conn, "OK STATUS")
+}
+
+func (s *Server) handleTyping(user *User, channelID int64) {
+	typingData := map[string]interface{}{
+		"user_id":    user.ID,
+		"username":   user.Username,
+		"channel_id": channelID,
+	}
+	typingJSON, _ := json.Marshal(typingData)
+
+	// Relay to all subscribers of this channel
+	s.subsMu.RLock()
+	subscribers := s.subscriptions[channelID]
+	s.subsMu.RUnlock()
+
+	s.mu.RLock()
+	for subUserID := range subscribers {
+		if subUserID == user.ID {
+			continue
+		}
+		if subUser, ok := s.users[subUserID]; ok {
+			s.sendToConn(subUser.Conn, "TYPING %s", string(typingJSON))
+		}
+	}
+	s.mu.RUnlock()
+}
+
+func (s *Server) handleInviteNotify(sender *User, targetID int, groupID int, groupName string) {
+	s.mu.RLock()
+	target, online := s.users[targetID]
+	s.mu.RUnlock()
+
+	if !online {
+		s.sendToConn(sender.Conn, "OK INVITE_NOTIFY offline")
+		return
+	}
+
+	inviteData := map[string]interface{}{
+		"inviter_id":   sender.ID,
+		"inviter_name": sender.Username,
+		"group_id":     groupID,
+		"group_name":   groupName,
+	}
+	inviteJSON, _ := json.Marshal(inviteData)
+
+	s.sendToConn(target.Conn, "INVITE %s", string(inviteJSON))
+	s.sendToConn(sender.Conn, "OK INVITE_NOTIFY")
+}
+
+func (s *Server) handleProfileUpdate(user *User, jsonPayload string) {
+	// Broadcast profile changes to online friends
+	s.subsMu.RLock()
+	friends := s.userFriends[user.ID]
+	s.subsMu.RUnlock()
+
+	profileData := map[string]interface{}{
+		"user_id": user.ID,
+		"update":  jsonPayload,
+	}
+	profileJSON, _ := json.Marshal(profileData)
+
+	s.mu.RLock()
+	for friendID := range friends {
+		if friend, ok := s.users[friendID]; ok {
+			s.sendToConn(friend.Conn, "PROFILE_UPDATE %s", string(profileJSON))
+		}
+	}
+	s.mu.RUnlock()
+
+	s.sendToConn(user.Conn, "OK PROFILE_UPDATE")
+}
+
+func (s *Server) storeGroupMessagePHP(token string, groupID int, content string) {
+	payload := map[string]interface{}{
+		"token":    token,
+		"group_id": groupID,
+		"content":  content,
+	}
+	jsonData, _ := json.Marshal(payload)
+
+	resp, err := http.Post(PHP_BASE_URL+"send_group_message.php", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to store group message via PHP: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+}
+
+func (s *Server) loadUserFriends(userID int, token string) {
+	// Fetch friends list from PHP backend
+	resp, err := http.Get(fmt.Sprintf("%sget_friends.php?token=%s", PHP_BASE_URL, token))
+	if err != nil {
+		log.Printf("Failed to fetch friends for user %d: %v", userID, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	var result struct {
+		Success bool `json:"success"`
+		Friends []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"friends"`
+	}
+
+	if json.Unmarshal(body, &result) == nil && result.Success {
+		s.subsMu.Lock()
+		s.userFriends[userID] = make(map[int]bool)
+		for _, friend := range result.Friends {
+			if friend.Status == "accepted" {
+				friendID, _ := strconv.Atoi(friend.ID)
+				s.userFriends[userID][friendID] = true
+			}
+		}
+		s.subsMu.Unlock()
+		log.Printf("Loaded %d friends for user %d", len(s.userFriends[userID]), userID)
+	}
+}
+
+func (s *Server) cleanupUserSubscriptions(userID int) {
+	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
+
+	// Remove from all channel subscriptions
+	if channels, ok := s.userSubs[userID]; ok {
+		for channelID := range channels {
+			if subs, ok := s.subscriptions[channelID]; ok {
+				delete(subs, userID)
+				if len(subs) == 0 {
+					delete(s.subscriptions, channelID)
+				}
+			}
+		}
+		delete(s.userSubs, userID)
+	}
+
+	// Remove friends cache
+	delete(s.userFriends, userID)
 }

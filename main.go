@@ -1267,25 +1267,35 @@ func (s *Server) loadUserFriends(userID int, token string) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	log.Printf("get_friends.php response for user %d: %s", userID, string(body))
+
 	var result struct {
 		Success bool `json:"success"`
 		Friends []struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
+			ID               string `json:"id"`
+			FriendshipStatus string `json:"friendship_status"` // PHP returns friendship_status, not status
 		} `json:"friends"`
 	}
 
-	if json.Unmarshal(body, &result) == nil && result.Success {
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Printf("Failed to parse friends response for user %d: %v", userID, err)
+		return
+	}
+
+	if result.Success {
 		s.subsMu.Lock()
 		s.userFriends[userID] = make(map[int]bool)
 		for _, friend := range result.Friends {
-			if friend.Status == "accepted" {
+			if friend.FriendshipStatus == "accepted" {
 				friendID, _ := strconv.Atoi(friend.ID)
 				s.userFriends[userID][friendID] = true
+				log.Printf("User %d has accepted friend: %d", userID, friendID)
 			}
 		}
 		s.subsMu.Unlock()
-		log.Printf("Loaded %d friends for user %d", len(s.userFriends[userID]), userID)
+		log.Printf("Loaded %d accepted friends for user %d", len(s.userFriends[userID]), userID)
+	} else {
+		log.Printf("get_friends.php returned success=false for user %d", userID)
 	}
 }
 

@@ -401,8 +401,13 @@ func (s *Server) handleAuth(conn net.Conn, token string) *User {
 	s.updateUserStatus(userID, "online")
 	log.Printf("User %d (%s) authenticated", userID, username)
 
-	// Load friends list for status broadcasts
-	go s.loadUserFriends(userID, token)
+	// Load friends list for status broadcasts, then notify them we're online
+	go func() {
+		s.loadUserFriends(userID, token)
+		// Small delay to ensure friends are loaded
+		time.Sleep(500 * time.Millisecond)
+		s.broadcastFriendOnline(user)
+	}()
 
 	return user
 }
@@ -756,6 +761,9 @@ func (s *Server) handleDisconnect(user *User) {
 		}
 	}
 	s.udpMu.Unlock()
+
+	// Broadcast offline to friends BEFORE cleanup (need friends list)
+	s.broadcastFriendOffline(user)
 
 	// Cleanup channel subscriptions and friends cache
 	s.cleanupUserSubscriptions(user.ID)
@@ -1300,4 +1308,61 @@ func (s *Server) cleanupUserSubscriptions(userID int) {
 
 	// Remove friends cache
 	delete(s.userFriends, userID)
+}
+
+func (s *Server) broadcastFriendOnline(user *User) {
+	s.subsMu.RLock()
+	friends := s.userFriends[user.ID]
+	s.subsMu.RUnlock()
+
+	if len(friends) == 0 {
+		return
+	}
+
+	user.mu.Lock()
+	status := user.Status
+	user.mu.Unlock()
+
+	onlineData := map[string]interface{}{
+		"user_id":  user.ID,
+		"username": user.Username,
+		"status":   status,
+	}
+	onlineJSON, _ := json.Marshal(onlineData)
+
+	s.mu.RLock()
+	for friendID := range friends {
+		if friend, ok := s.users[friendID]; ok {
+			s.sendToConn(friend.Conn, "FRIEND_ONLINE %s", string(onlineJSON))
+		}
+	}
+	s.mu.RUnlock()
+
+	log.Printf("Broadcast FRIEND_ONLINE for user %d to %d friends", user.ID, len(friends))
+}
+
+func (s *Server) broadcastFriendOffline(user *User) {
+	s.subsMu.RLock()
+	friends := s.userFriends[user.ID]
+	s.subsMu.RUnlock()
+
+	if len(friends) == 0 {
+		return
+	}
+
+	offlineData := map[string]interface{}{
+		"user_id":  user.ID,
+		"username": user.Username,
+	}
+	offlineJSON, _ := json.Marshal(offlineData)
+
+	s.mu.RLock()
+	for friendID := range friends {
+		if friend, ok := s.users[friendID]; ok {
+			s.sendToConn(friend.Conn, "FRIEND_OFFLINE %s", string(offlineJSON))
+		}
+	}
+	s.mu.RUnlock()
+
+	log.Printf("Broadcast FRIEND_OFFLINE for user %d to %d friends", user.ID, len(friends))
 }

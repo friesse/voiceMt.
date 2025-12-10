@@ -1259,7 +1259,9 @@ func (s *Server) storeGroupMessagePHP(token string, groupID int, content string)
 
 func (s *Server) loadUserFriends(userID int, token string) {
 	// Fetch friends list from PHP backend
-	resp, err := http.Get(fmt.Sprintf("%sget_friends.php?token=%s", PHP_BASE_URL, token))
+	// NOTE: IONOS is currently returning 503 for the token-based path from this VPS,
+	// but the debug_user_id path works reliably. Use debug_user_id for now.
+	resp, err := http.Get(fmt.Sprintf("%sget_friends.php?debug_user_id=%d", PHP_BASE_URL, userID))
 	if err != nil {
 		log.Printf("Failed to fetch friends for user %d: %v", userID, err)
 		return

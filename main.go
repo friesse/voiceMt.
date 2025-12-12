@@ -1307,8 +1307,8 @@ func (s *Server) loadUserFriends(userID int, token string) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	url := fmt.Sprintf("%sget_friends.php?debug_user_id=%d", PHP_BASE_URL, userID)
 
-	maxAttempts := 5
-	backoff := 500 * time.Millisecond
+	maxAttempts := 3
+	backoff := 300 * time.Millisecond
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		resp, err := client.Get(url)
@@ -1319,10 +1319,8 @@ func (s *Server) loadUserFriends(userID int, token string) {
 			resp.Body.Close()
 
 			if resp.StatusCode != 200 {
-				log.Printf("get_friends.php non-200 for user %d (attempt %d/%d): HTTP %d body: %s", userID, attempt, maxAttempts, resp.StatusCode, string(body))
+				log.Printf("get_friends.php non-200 for user %d (attempt %d/%d): HTTP %d", userID, attempt, maxAttempts, resp.StatusCode)
 			} else {
-				log.Printf("get_friends.php response for user %d: %s", userID, string(body))
-
 				var result struct {
 					Success bool `json:"success"`
 					Friends []struct {
@@ -1340,7 +1338,6 @@ func (s *Server) loadUserFriends(userID int, token string) {
 					for _, friend := range result.Friends {
 						if friend.FriendshipStatus == "accepted" {
 							newFriends[friend.ID] = true
-							log.Printf("User %d has accepted friend: %d", userID, friend.ID)
 						}
 					}
 
@@ -1355,16 +1352,13 @@ func (s *Server) loadUserFriends(userID int, token string) {
 
 		if attempt < maxAttempts {
 			time.Sleep(backoff)
-			if backoff < 8*time.Second {
-				backoff *= 2
-			}
+			backoff *= 2
 		}
 	}
 
-	if os.Getenv("VOICEMT_FRIENDS_FALLBACK") == "1" {
-		s.setFallbackFriendsForUser(userID)
-		log.Printf("Using fallback friends list for user %d", userID)
-	}
+	// IONOS is flaky - ALWAYS use fallback mode so presence/calls work
+	log.Printf("IONOS failed for user %d, using fallback friends (all connected users)", userID)
+	s.setFallbackFriendsForUser(userID)
 }
 
 func (s *Server) setFallbackFriendsForUser(userID int) {

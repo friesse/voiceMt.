@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -1303,46 +1304,86 @@ func (s *Server) storeGroupMessagePHP(token string, groupID int, content string)
 }
 
 func (s *Server) loadUserFriends(userID int, token string) {
-	// Fetch friends list from PHP backend
-	// NOTE: IONOS is currently returning 503 for the token-based path from this VPS,
-	// but the debug_user_id path works reliably. Use debug_user_id for now.
-	resp, err := http.Get(fmt.Sprintf("%sget_friends.php?debug_user_id=%d", PHP_BASE_URL, userID))
-	if err != nil {
-		log.Printf("Failed to fetch friends for user %d: %v", userID, err)
-		return
-	}
-	defer resp.Body.Close()
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := fmt.Sprintf("%sget_friends.php?debug_user_id=%d", PHP_BASE_URL, userID)
 
-	body, _ := io.ReadAll(resp.Body)
-	log.Printf("get_friends.php response for user %d: %s", userID, string(body))
+	maxAttempts := 5
+	backoff := 500 * time.Millisecond
 
-	var result struct {
-		Success bool `json:"success"`
-		Friends []struct {
-			ID               int    `json:"id"`
-			FriendshipStatus string `json:"friendship_status"` // PHP returns friendship_status, not status
-		} `json:"friends"`
-	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Failed to fetch friends for user %d (attempt %d/%d): %v", userID, attempt, maxAttempts, err)
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 
-	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("Failed to parse friends response for user %d: %v", userID, err)
-		return
-	}
+			if resp.StatusCode != 200 {
+				log.Printf("get_friends.php non-200 for user %d (attempt %d/%d): HTTP %d body: %s", userID, attempt, maxAttempts, resp.StatusCode, string(body))
+			} else {
+				log.Printf("get_friends.php response for user %d: %s", userID, string(body))
 
-	if result.Success {
-		s.subsMu.Lock()
-		s.userFriends[userID] = make(map[int]bool)
-		for _, friend := range result.Friends {
-			if friend.FriendshipStatus == "accepted" {
-				s.userFriends[userID][friend.ID] = true
-				log.Printf("User %d has accepted friend: %d", userID, friend.ID)
+				var result struct {
+					Success bool `json:"success"`
+					Friends []struct {
+						ID               int    `json:"id"`
+						FriendshipStatus string `json:"friendship_status"`
+					} `json:"friends"`
+				}
+
+				if err := json.Unmarshal(body, &result); err != nil {
+					log.Printf("Failed to parse friends response for user %d (attempt %d/%d): %v", userID, attempt, maxAttempts, err)
+				} else if !result.Success {
+					log.Printf("get_friends.php returned success=false for user %d (attempt %d/%d)", userID, attempt, maxAttempts)
+				} else {
+					newFriends := make(map[int]bool)
+					for _, friend := range result.Friends {
+						if friend.FriendshipStatus == "accepted" {
+							newFriends[friend.ID] = true
+							log.Printf("User %d has accepted friend: %d", userID, friend.ID)
+						}
+					}
+
+					s.subsMu.Lock()
+					s.userFriends[userID] = newFriends
+					s.subsMu.Unlock()
+					log.Printf("Loaded %d accepted friends for user %d", len(newFriends), userID)
+					return
+				}
 			}
 		}
-		s.subsMu.Unlock()
-		log.Printf("Loaded %d accepted friends for user %d", len(s.userFriends[userID]), userID)
-	} else {
-		log.Printf("get_friends.php returned success=false for user %d", userID)
+
+		if attempt < maxAttempts {
+			time.Sleep(backoff)
+			if backoff < 8*time.Second {
+				backoff *= 2
+			}
+		}
 	}
+
+	if os.Getenv("VOICEMT_FRIENDS_FALLBACK") == "1" {
+		s.setFallbackFriendsForUser(userID)
+		log.Printf("Using fallback friends list for user %d", userID)
+	}
+}
+
+func (s *Server) setFallbackFriendsForUser(userID int) {
+	newFriends := make(map[int]bool)
+
+	s.mu.RLock()
+	for otherID := range s.users {
+		if otherID == userID {
+			continue
+		}
+		newFriends[otherID] = true
+	}
+	s.mu.RUnlock()
+
+	s.subsMu.Lock()
+	if len(newFriends) > 0 {
+		s.userFriends[userID] = newFriends
+	}
+	s.subsMu.Unlock()
 }
 
 func (s *Server) cleanupUserSubscriptions(userID int) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"hash/crc32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -404,12 +405,44 @@ func (s *Server) handleAuth(conn net.Conn, token string) *User {
 	// Load friends list for status broadcasts, then notify them we're online
 	go func() {
 		s.loadUserFriends(userID, token)
-		// Small delay to ensure friends are loaded
-		time.Sleep(500 * time.Millisecond)
+		// Notify friends about this user's online status.
 		s.broadcastFriendOnline(user)
+		// Also tell the newly-authenticated user which of their friends are already online.
+		s.sendOnlineFriendsToUser(user)
 	}()
 
 	return user
+}
+
+func (s *Server) sendOnlineFriendsToUser(user *User) {
+	s.subsMu.RLock()
+	friends := s.userFriends[user.ID]
+	s.subsMu.RUnlock()
+
+	if len(friends) == 0 {
+		return
+	}
+
+	s.mu.RLock()
+	for friendID := range friends {
+		friend, ok := s.users[friendID]
+		if !ok {
+			continue
+		}
+
+		friend.mu.Lock()
+		status := friend.Status
+		friend.mu.Unlock()
+
+		onlineData := map[string]interface{}{
+			"user_id":  friend.ID,
+			"username": friend.Username,
+			"status":   status,
+		}
+		onlineJSON, _ := json.Marshal(onlineData)
+		s.sendToConn(user.Conn, "FRIEND_ONLINE %s", string(onlineJSON))
+	}
+	s.mu.RUnlock()
 }
 
 func (s *Server) handleCall(caller *User, targetID int) {
@@ -712,16 +745,28 @@ func (s *Server) handleMessage(sender *User, recipientID int, content string) {
 	recipient, online := s.users[recipientID]
 	s.mu.RUnlock()
 
-	msg := Message{
-		SenderID:    sender.ID,
-		RecipientID: recipientID,
-		Content:     content,
-		Timestamp:   time.Now().Format(time.RFC3339),
+	// Channel ID must match PHP (send_message.php) behavior: crc32("min_max")
+	minID := sender.ID
+	maxID := recipientID
+	if minID > maxID {
+		minID, maxID = maxID, minID
 	}
-	msgJSON, _ := json.Marshal(msg)
+	key := fmt.Sprintf("%d_%d", minID, maxID)
+	channelID := int64(crc32.ChecksumIEEE([]byte(key)))
+
+	msgData := map[string]interface{}{
+		"sender_id":   sender.ID,
+		"sender_name": sender.Username,
+		"recipient_id": recipientID,
+		"channel_id":  channelID,
+		"content":     content,
+		"timestamp":   time.Now().Format(time.RFC3339),
+	}
+	msgJSON, _ := json.Marshal(msgData)
 
 	if online {
-		s.sendToConn(recipient.Conn, "MSG %s", string(msgJSON))
+		// Client expects NEW_MSG
+		s.sendToConn(recipient.Conn, "NEW_MSG %s", string(msgJSON))
 	}
 
 	s.sendToConn(sender.Conn, "OK MSG")
@@ -1274,7 +1319,7 @@ func (s *Server) loadUserFriends(userID int, token string) {
 	var result struct {
 		Success bool `json:"success"`
 		Friends []struct {
-			ID               string `json:"id"`
+			ID               int    `json:"id"`
 			FriendshipStatus string `json:"friendship_status"` // PHP returns friendship_status, not status
 		} `json:"friends"`
 	}
@@ -1289,9 +1334,8 @@ func (s *Server) loadUserFriends(userID int, token string) {
 		s.userFriends[userID] = make(map[int]bool)
 		for _, friend := range result.Friends {
 			if friend.FriendshipStatus == "accepted" {
-				friendID, _ := strconv.Atoi(friend.ID)
-				s.userFriends[userID][friendID] = true
-				log.Printf("User %d has accepted friend: %d", userID, friendID)
+				s.userFriends[userID][friend.ID] = true
+				log.Printf("User %d has accepted friend: %d", userID, friend.ID)
 			}
 		}
 		s.subsMu.Unlock()

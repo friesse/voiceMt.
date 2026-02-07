@@ -12,7 +12,7 @@ High-performance voice relay and instant messaging server for the Whelm/Aerochat
 
 ## Resource Requirements
 
-Based on 6 vCPU, 12GB RAM, 275mbps down / 225mbps up Debian server:
+Based on my 6 vCPU, 12GB RAM, 275mbps down / 225mbps up Debian server:
 
 | Resource | Allocation | Notes |
 |----------|-----------|-------|
@@ -124,7 +124,3 @@ Uses existing Whelm `users` and `messages` tables:
 -- users table must have: id, username, session_token, status, last_seen
 -- messages table must have: id, sender_id, channel_id, content, timestamp
 ```
-
-## License
-
-Same as Aerochat project.
